@@ -26,6 +26,7 @@ import rlax
 
 from disco_rl import types
 from disco_rl import utils
+from disco_rl import continuous_policies
 
 
 DEFAULT_DISCOUNT = 0.995
@@ -50,6 +51,12 @@ def get_value_outs(
     td_ema_state: types.EmaState | chex.ArrayTree | None = None,
     td_ema_fn: utils.MovingAverage | None = None,
     axis_name: str | None = None,
+    continuous_actions: bool = False,
+    kde_bandwidth: float = 0.1,
+    action_minimum: float = -1.0,
+    action_maximum: float = 1.0,
+    q_action_net_out: chex.Array | None = None,
+    target_q_action_net_out: chex.Array | None = None,
 ) -> tuple[types.ValueOuts, types.EmaState | None, types.EmaState | None]:
   """Gets value outs and updates EMA state, handling multi-discount values.
 
@@ -139,6 +146,7 @@ def get_value_outs(
       categorical_value=categorical_value,
       max_abs_value=max_abs_value,
       nonlinear_transform=nonlinear_transform,
+      continuous_actions=continuous_actions,
   )
 
   if target_value_net_out is None and target_q_net_out is None:
@@ -152,6 +160,7 @@ def get_value_outs(
         categorical_value=categorical_value,
         max_abs_value=max_abs_value,
         nonlinear_transform=nonlinear_transform,
+        continuous_actions=continuous_actions,
     )
 
   # Preprocess rollouts.
@@ -167,10 +176,27 @@ def get_value_outs(
       jax.tree.map(lambda x: x[:-1], pi_logits),
       jax.tree.map(lambda x: x[:-1], mu_logits),
       actions,
+      continuous_actions=continuous_actions,
+      kde_bandwidth=kde_bandwidth,
+      action_minimum=action_minimum,
+      action_maximum=action_maximum,
   )
 
   # Get value targets and value outs
   if q_values is not None:
+    q_action_values = None
+    target_q_action_values = None
+    if continuous_actions:
+      if q_action_net_out is None or target_q_action_net_out is None:
+        raise ValueError('Continuous Retrace requires Q at the executed action.')
+      scalar_q = functools.partial(
+          get_values_from_net_outs,
+          nonlinear_transform=nonlinear_transform,
+          categorical_value=categorical_value,
+          max_abs_value=max_abs_value,
+      )
+      q_action_values = scalar_q(q_action_net_out)
+      target_q_action_values = scalar_q(target_q_action_net_out)
     # Estimate state-action values.
     chex.assert_rank(q_values, 3)
     value_outs = estimate_q_values(
@@ -184,6 +210,8 @@ def get_value_outs(
         target_q_values,
         discount,
         lambda_,
+        q_action_values=q_action_values,
+        target_q_action_values=target_q_action_values,
     )
   else:
     # Estimate state values, returning dummy q values.
@@ -331,6 +359,8 @@ def estimate_q_values(
     target_q_values: chex.ArrayTree,
     discount: float = DEFAULT_DISCOUNT,
     lambda_: float = DEFAULT_TD_LAMBDA,
+    q_action_values: chex.Array | None = None,
+    target_q_action_values: chex.Array | None = None,
 ) -> types.ValueOuts:
   """Get action-value estimates from values and rollouts with Retrace.
 
@@ -356,10 +386,16 @@ def estimate_q_values(
   chex.assert_equal_shape_prefix(
       (values, jax.tree_util.tree_leaves(q_values)[0]), 2
   )
-  q_a = jax.tree.map(lambda x: utils.batch_lookup(x[:-1], actions), q_values)
-  target_q_a = jax.tree.map(
-      lambda x: utils.batch_lookup(x[:-1], actions), target_q_values
-  )
+  if q_action_values is None:
+    q_a = jax.tree.map(lambda x: utils.batch_lookup(x[:-1], actions), q_values)
+    target_q_a = jax.tree.map(
+        lambda x: utils.batch_lookup(x[:-1], actions), target_q_values
+    )
+  else:
+    if target_q_action_values is None:
+      raise ValueError('Both online and target executed-action Q are required.')
+    q_a = q_action_values[:-1]
+    target_q_a = target_q_action_values[:-1]
 
   # Vmap for batch dimension.
   batch_retrace_fn = jax.vmap(
@@ -453,6 +489,7 @@ def extract_scalar_values_from_net_out(
     categorical_value: bool,
     max_abs_value: float | None,
     nonlinear_transform: bool,
+    continuous_actions: bool = False,
 ) -> tuple[chex.Array, chex.ArrayTree | None]:
   """Extract scalar values from network outputs."""
   if categorical_value and max_abs_value is None:
@@ -483,11 +520,13 @@ def extract_scalar_values_from_net_out(
     q_values = None
 
   if values is None:
-    # Get state values from Q-values if values are not explicitly given
-    pi_tree = jax.tree.map(jax.nn.softmax, pi_logits)
-    values = jax.tree.map(
-        lambda p, q: jnp.sum(p * q, axis=2), pi_tree, q_values
-    )
+    if continuous_actions:
+      values = jax.tree.map(lambda q: jnp.mean(q, axis=2), q_values)
+    else:
+      pi_tree = jax.tree.map(jax.nn.softmax, pi_logits)
+      values = jax.tree.map(
+          lambda p, q: jnp.sum(p * q, axis=2), pi_tree, q_values
+      )
 
   return values, q_values
 
@@ -496,16 +535,31 @@ def importance_weight(
     pi_logits: chex.ArrayTree,
     mu_logits: chex.ArrayTree,
     actions: chex.ArrayTree,
+    continuous_actions: bool = False,
+    kde_bandwidth: float = 0.1,
+    action_minimum: float = -1.0,
+    action_maximum: float = 1.0,
 ) -> chex.Array:
   """Calculate importance weights from logits."""
-  log_prob_fn = lambda t, a: distrax.Softmax(t).log_prob(a)
+  if continuous_actions:
+    log_prob_fn = lambda t, a: continuous_policies.kde_log_prob(
+        t, a, kde_bandwidth, action_minimum, action_maximum
+    )
+  else:
+    log_prob_fn = lambda t, a: distrax.Softmax(t).log_prob(a)
   log_pi_a_tree = jax.tree.map(log_prob_fn, pi_logits, actions)
   log_mu_a_tree = jax.tree.map(log_prob_fn, mu_logits, actions)
 
   # Joint probs.
   log_pi_a = sum(jax.tree_util.tree_leaves(log_pi_a_tree))
   log_mu_a = sum(jax.tree_util.tree_leaves(log_mu_a_tree))
-  rho = jax.lax.stop_gradient(jnp.exp(log_pi_a - log_mu_a))
+  log_ratio = log_pi_a - log_mu_a
+  if continuous_actions:
+    # Retrace clips ratios at one; cap only numerical overflow before that.
+    log_ratio = jnp.minimum(
+        log_ratio, jnp.log(jnp.finfo(log_ratio.dtype).max) - 1.0
+    )
+  rho = jax.lax.stop_gradient(jnp.exp(log_ratio))
   return rho
 
 

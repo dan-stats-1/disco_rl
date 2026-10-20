@@ -81,6 +81,10 @@ class ValueFnConfig:
   outer_value_cost: float
   ema_decay: float = 0.99
   ema_eps: float = 1e-6
+  continuous_actions: bool = False
+  kde_bandwidth: float = 0.1
+  action_minimum: float = -1.0
+  action_maximum: float = 1.0
 
 
 @chex.dataclass

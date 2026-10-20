@@ -30,6 +30,7 @@ def get_agent_out_spec(
     action_spec: types.ActionSpec,
     flat_out_spec: types.Specs,
     model_out_spec: types.Specs,
+    num_samples: int | None = None,
 ) -> types.Specs:
   """Constructs a tree of shapes of outputs for the provided specs.
 
@@ -53,6 +54,7 @@ def get_agent_out_spec(
       action_spec: An action spec.
       flat_out_spec: A nested dict of agent's flat output shapes.
       model_out_spec: A nested dict of agent's model output shapes.
+      num_samples: Conditioning sample count for a continuous policy.
 
   Returns:
       A nested dict with shapes specifying agent's total output shapes.
@@ -63,10 +65,15 @@ def get_agent_out_spec(
         f'Given: {flat_out_spec} and {model_out_spec}'
     )
 
-  num_actions = utils.get_num_actions_from_spec(action_spec)
+  num_actions = (
+      utils.get_num_actions_from_spec(action_spec)
+      if num_samples is None else num_samples
+  )
   agent_out_spec = {key: val for key, val in flat_out_spec.items()}
   for key, val in model_out_spec.items():
     agent_out_spec[key] = ArraySpec((num_actions, *val.shape), val.dtype)
+    if num_samples is not None:
+      agent_out_spec[key + '_a'] = val
   return agent_out_spec
 
 
@@ -84,16 +91,33 @@ class UpdateRule:
     t = 2
     unroll_batch_shape = (t, b)
     bootstrapped_shape = (t + 1, b)
-    dummy_action_spec = dm_env_specs.BoundedArray(
-        shape=(3,), dtype=int, minimum=0, maximum=3
+    continuous = getattr(self, '_continuous_actions', False)
+    dummy_action_spec = (
+        dm_env_specs.BoundedArray(
+            (), jnp.float32, self._action_minimum, self._action_maximum
+        )
+        if continuous else dm_env_specs.BoundedArray(
+            shape=(3,), dtype=int, minimum=0, maximum=3
+        )
     )
-    num_actions = utils.get_num_actions_from_spec(dummy_action_spec)
-    dummy_actions = jnp.zeros(bootstrapped_shape, dtype=jnp.int32)
+    num_actions = (
+        self._num_samples if continuous
+        else utils.get_num_actions_from_spec(dummy_action_spec)
+    )
+    dummy_actions = jnp.zeros(
+        bootstrapped_shape, dtype=jnp.float32 if continuous else jnp.int32
+    )
+    if continuous:
+      dummy_actions += (self._action_minimum + self._action_maximum) / 2.0
     agent_out_shapes = self.agent_output_spec(dummy_action_spec)
 
     agent_out = jax.tree.map(
         lambda s: jnp.zeros(bootstrapped_shape + s.shape), agent_out_shapes
     )
+    if continuous:
+      midpoint = (self._action_minimum + self._action_maximum) / 2.0
+      for key in ('logits', 'aux_pi', 'aux_pi_a'):
+        agent_out[key] = jnp.full_like(agent_out[key], midpoint)
 
     dummy_input = types.UpdateRuleInputs(
         observations=jnp.zeros(bootstrapped_shape),
@@ -201,6 +225,10 @@ class UpdateRule:
         action_spec=action_spec,
         flat_out_spec=self.flat_output_spec(action_spec),
         model_out_spec=self.model_output_spec(action_spec),
+        num_samples=(
+            self._num_samples
+            if getattr(self, '_continuous_actions', False) else None
+        ),
     )
 
   def init_meta_state(

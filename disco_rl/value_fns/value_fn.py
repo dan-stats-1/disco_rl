@@ -135,6 +135,10 @@ class ValueFunction:
         td_ema_state=value_state.td_ema_state,
         td_ema_fn=self._td_ema,
         axis_name=self.axis_name,
+        continuous_actions=self.config.continuous_actions,
+        kde_bandwidth=self.config.kde_bandwidth,
+        action_minimum=self.config.action_minimum,
+        action_maximum=self.config.action_maximum,
     )
     return value_outs, value_net_outputs, adv_ema_state, td_ema_state
 

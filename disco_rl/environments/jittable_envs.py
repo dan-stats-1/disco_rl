@@ -15,6 +15,9 @@
 
 """Jittable environments."""
 
+import math
+
+from dm_env import specs
 import jax
 import jax.numpy as jnp
 from ml_collections import config_dict
@@ -99,5 +102,101 @@ def get_config_catch() -> config_dict.ConfigDict:
       dict(
           rows=8,
           columns=8,
+      )
+  )
+
+
+class _SingleStreamContinuousCatch:
+  """Catch with a continuous paddle position and direct velocity control.
+
+  State is [ball_y, ball_x, paddle_y, paddle_x], stored as float32. The
+  ball falls one row per step. Actions in [-1, 1] move the paddle by
+  action * max_speed columns without inertia. Out-of-range actions are clipped.
+  """
+
+  def __init__(
+      self,
+      rows: int = 8,
+      columns: int = 8,
+      max_speed: float = 1.0,
+      catch_radius: float = 0.5,
+  ):
+    if not isinstance(rows, int) or rows < 2:
+      raise ValueError('rows must be an integer greater than or equal to 2.')
+    if not isinstance(columns, int) or columns < 2:
+      raise ValueError('columns must be an integer greater than or equal to 2.')
+    if not math.isfinite(max_speed) or max_speed <= 0:
+      raise ValueError('max_speed must be finite and positive.')
+    if not math.isfinite(catch_radius) or catch_radius <= 0:
+      raise ValueError('catch_radius must be finite and positive.')
+    self._rows = rows
+    self._columns = columns
+    self._max_speed = max_speed
+    self._catch_radius = catch_radius
+
+  def initial_state(self, rng):
+    ball_x = jax.random.uniform(
+        rng, (), dtype=jnp.float32, minval=0.0, maxval=self._columns - 1.0
+    )
+    return jnp.array(
+        [0.0, ball_x, self._rows - 1.0, (self._columns - 1.0) / 2.0],
+        dtype=jnp.float32,
+    )
+
+  def episode_reset(self, rng, state):
+    del state
+    return self.initial_state(rng)
+
+  def step(self, rng, state, action):
+    del rng
+    velocity = jnp.clip(action, -1.0, 1.0) * self._max_speed
+    paddle_x = jnp.clip(state[3] + velocity, 0.0, self._columns - 1.0)
+    return state.at[0].add(1.0).at[3].set(paddle_x)
+
+  def is_terminal(self, state):
+    return state[0] >= state[2]
+
+  def render(self, state):
+    """Returns normalized [ball_y, ball_x, paddle_x], without rasterization."""
+    return jnp.array(
+        [
+            state[0] / (self._rows - 1.0),
+            state[1] / (self._columns - 1.0),
+            state[3] / (self._columns - 1.0),
+        ],
+        dtype=jnp.float32,
+    )
+
+  def reward(self, state):
+    caught = jnp.abs(state[1] - state[3]) <= self._catch_radius
+    return jnp.where(self.is_terminal(state), jnp.where(caught, 1.0, -1.0), 0.0)
+
+
+class ContinuousCatchJittableEnvironment(
+    batched_jittable_env.BatchedJittableEnvironment
+):
+  """Batched continuous Catch with scalar float32 actions in [-1, 1]."""
+
+  def __init__(
+      self,
+      batch_size: int,
+      env_settings: config_dict.ConfigDict,
+  ) -> None:
+    super().__init__(
+        _SingleStreamContinuousCatch,
+        batch_size,
+        env_settings,
+        action_spec=specs.BoundedArray((), jnp.float32, -1.0, 1.0),
+    )
+
+
+def get_config_continuous_catch() -> config_dict.ConfigDict:
+  """Returns the default configuration for continuous Catch."""
+  return config_dict.ConfigDict(
+      dict(
+          rows=8,
+          columns=8,
+          max_speed=1.0,
+          catch_radius=0.5,
       )
   )

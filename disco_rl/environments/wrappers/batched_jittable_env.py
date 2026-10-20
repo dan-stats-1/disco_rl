@@ -46,19 +46,22 @@ class EnvState:
 
 
 class BatchedJittableEnvironment(base.Environment):
-  """Wrapper for making a batched jitted disco env."""
+  """Batches a jittable environment with discrete or explicit action specs."""
 
   def __init__(
       self,
       env_class,
       batch_size: int,
       env_settings: configdict.ConfigDict,
+      action_spec: types.ActionSpec | None = None,
   ):
     self.batch_size = batch_size
     self._env = env_class(**env_settings.to_dict())
-    self._single_action_spec = dm_specs.BoundedArray(
-        (), np.int32, 0, self._env.num_actions - 1
-    )
+    if action_spec is None:
+      action_spec = dm_specs.BoundedArray(
+          (), np.int32, 0, self._env.num_actions - 1
+      )
+    self._single_action_spec = action_spec
 
     dummy_state = self._env.initial_state(jax.random.PRNGKey(0))
     obs = self._env.render(dummy_state)

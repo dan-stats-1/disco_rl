@@ -27,6 +27,7 @@ from jax import numpy as jnp
 
 from disco_rl import types
 from disco_rl import utils
+from disco_rl import continuous_policies
 from disco_rl.update_rules import input_transforms
 
 
@@ -59,6 +60,10 @@ class LSTM(MetaNet):
       aux_stddev: float | None = None,
       state_stddev: float | None = None,
       name: str | None = None,
+      continuous_actions: bool = False,
+      kde_bandwidth: float = 0.1,
+      action_minimum: float = -1.0,
+      action_maximum: float = 1.0,
   ) -> None:
     super().__init__(name=name)
     self._hidden_size = hidden_size
@@ -71,8 +76,14 @@ class LSTM(MetaNet):
     self._policy_target_init = _maybe_get_initializer(policy_target_stddev)
     self._policy_channels = policy_channels
     self._policy_target_channels = policy_target_channels
+    self._policy_kwargs = dict(
+        continuous_actions=continuous_actions,
+        kde_bandwidth=kde_bandwidth,
+        action_minimum=action_minimum,
+        action_maximum=action_maximum,
+    )
     self._meta_rnn_core: 'MetaLSTM' = MetaLSTM(
-        **meta_rnn_kwargs, input_option=input_option
+        **meta_rnn_kwargs, input_option=input_option, **self._policy_kwargs
     )
 
   def __call__(
@@ -104,6 +115,7 @@ class LSTM(MetaNet):
         policy_net=policy_net,
         input_option=self._input_option,
         axis_name=axis_name,
+        **self._policy_kwargs,
     )
 
     # Unroll the per-trajectory RNN core in reverse direction for bootstrapping.
@@ -144,6 +156,10 @@ class LSTM(MetaNet):
         w
     )  # [T, B, A, 1]
     pi_hat = jnp.squeeze(w, -1)  # [T, B, A]
+    if self._policy_kwargs['continuous_actions']:
+      minimum = self._policy_kwargs['action_minimum']
+      maximum = self._policy_kwargs['action_maximum']
+      pi_hat = minimum + (maximum - minimum) * (jnp.tanh(pi_hat) + 1.0) / 2.0
 
     # Set the meta network outputs.
     meta_out = dict(pi=pi_hat, y=y_hat, z=z_hat, meta_input_emb=meta_input_emb)
@@ -167,6 +183,10 @@ class MetaLSTM(hk.Module):
       embedding_size: Sequence[int],
       pred_embedding_size: Sequence[int],
       hidden_size: int,
+      continuous_actions: bool = False,
+      kde_bandwidth: float = 0.1,
+      action_minimum: float = -1.0,
+      action_maximum: float = 1.0,
   ):
     super().__init__()
     self._input_option = input_option
@@ -175,6 +195,12 @@ class MetaLSTM(hk.Module):
     self._policy_channels = policy_channels
     self._pred_embedding_size = pred_embedding_size
     self._core_constructor = lambda: hk.LSTM(self._hidden_size)
+    self._policy_kwargs = dict(
+        continuous_actions=continuous_actions,
+        kde_bandwidth=kde_bandwidth,
+        action_minimum=action_minimum,
+        action_maximum=action_maximum,
+    )
 
   def unroll(
       self,
@@ -196,6 +222,7 @@ class MetaLSTM(hk.Module):
         policy_net=policy_net,
         input_option=self._input_option,
         axis_name=axis_name,
+        **self._policy_kwargs,
     )
     input_list = [
         meta_inputs,
@@ -260,14 +287,19 @@ def _construct_input(
     z_net: Callable[[chex.Array], chex.Array],
     policy_net: Callable[[chex.Array], chex.Array],
     axis_name: str | None = None,
+    continuous_actions: bool = False,
+    kde_bandwidth: float = 0.1,
+    action_minimum: float = -1.0,
+    action_maximum: float = 1.0,
 ) -> tuple[chex.Array, chex.Array | None]:
   """Maps update rule inputs to a single vector."""
   unroll_len, batch_size = inputs.is_terminal.shape
 
   actions = jax.tree.map(lambda x: x[:-1], inputs.actions)  # [T, B]
   policy = lax.stop_gradient(
-      jax.nn.softmax(inputs.agent_out['logits'])
-  )  # [T+1, B, A]
+      inputs.agent_out['logits'] if continuous_actions
+      else jax.nn.softmax(inputs.agent_out['logits'])
+  )
   num_actions = policy.shape[2]
 
   def preprocess_from_config(inputs, preproc_config, prefix_shape):
@@ -288,7 +320,15 @@ def _construct_input(
         if tx == 'y_net':
           x = y_net(x)
         elif tx == 'z_net':
+          if continuous_actions and x.ndim == 3:
+            x = x[:, :, None, :]
           x = z_net(x)
+        elif tx == 'log_prob_a':
+          x = continuous_policies.kde_log_prob(
+              x, actions, kde_bandwidth, action_minimum, action_maximum
+          )
+        elif tx == 'pi_weighted_avg' and continuous_actions:
+          x = jnp.mean(x, axis=2)
         else:
           if tx not in input_transforms.TRANSFORMS:
             raise KeyError(
@@ -313,15 +353,22 @@ def _construct_input(
         input_option.action_conditional,
         prefix_shape=(unroll_len, batch_size, num_actions),
     )
-    act_cond_inputs.append(
-        jnp.expand_dims(
-            jax.nn.one_hot(actions, num_actions, dtype=jnp.float32), axis=-1
-        )
-    )
+    if continuous_actions:
+      act_cond_inputs.append(policy[:-1, :, :, None])
+      act_cond_inputs.append((policy[:-1] - actions[:, :, None])[..., None])
+    else:
+      act_cond_inputs.append(
+          jnp.expand_dims(
+              jax.nn.one_hot(actions, num_actions, dtype=jnp.float32), axis=-1
+          )
+      )
     act_cond_inputs = jnp.concatenate(act_cond_inputs, axis=-1)
     act_cond_emb = policy_net(act_cond_inputs)  # [T, B, A, C]
     act_cond_emb_avg = jnp.mean(act_cond_emb, axis=2)  # [T, B, C]
-    act_cond_emb_a = utils.batch_lookup(act_cond_emb, actions)  # [T, B, C]
+    act_cond_emb_a = (
+        actions[..., None] if continuous_actions
+        else utils.batch_lookup(act_cond_emb, actions)
+    )
     inputs_t += [act_cond_emb_avg, act_cond_emb_a]
   else:
     act_cond_emb = None

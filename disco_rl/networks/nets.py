@@ -91,7 +91,9 @@ class MLPHeadNet(hk.Module):
     """Compute embedding from agent inputs."""
     raise NotImplementedError
 
-  def _head_pass(self, embedding: chex.Array) -> dict[str, chex.Array]:
+  def _head_pass(
+      self, embedding: chex.Array, policy_noise: chex.Array | None = None
+  ) -> dict[str, chex.Array]:
     """Compute outputs as linear functions of embedding."""
     embedding = hk.Flatten()(embedding)
 
@@ -104,7 +106,28 @@ class MLPHeadNet(hk.Module):
       output = output.reshape((embedding.shape[0], *spec.shape))
       return output
 
-    return jax.tree.map(_infer, self._out_spec)
+    if policy_noise is None:
+      return jax.tree.map(_infer, self._out_spec)
+    chex.assert_shape(
+        policy_noise,
+        (embedding.shape[0], self._out_spec['logits'].shape[0], 1),
+    )
+    out = {
+        key: _infer(spec)
+        for key, spec in self._out_spec.items()
+        if key != 'logits'
+    }
+    sample_shape = policy_noise.shape[:2]
+    state = jnp.broadcast_to(
+        embedding[:, None, :], (*sample_shape, embedding.shape[-1])
+    )
+    generator_input = jnp.concatenate([state, policy_noise], axis=-1)
+    samples = hk.nets.MLP((64, 64, 1), name='policy_generator')(generator_input)
+    minimum, maximum = self._action_spec.minimum, self._action_spec.maximum
+    out['logits'] = minimum + (maximum - minimum) * (
+        jnp.tanh(samples[..., 0]) + 1.0
+    ) / 2.0
+    return out
 
   def unroll(
       self, inputs: chex.ArrayTree, should_reset: chex.Array | None = None
@@ -116,10 +139,32 @@ class MLPHeadNet(hk.Module):
       self, inputs: chex.ArrayTree, should_reset: chex.Array | None = None
   ) -> dict[str, chex.Array]:
     torso = self._embedding_pass(inputs)
-    out = self._head_pass(torso)
+    continuous = (
+        'logits' in self._out_spec
+        and hasattr(self._action_spec, 'dtype')
+        and np.issubdtype(self._action_spec.dtype, np.floating)
+    )
+    policy_noise = None
+    if continuous:
+      if not isinstance(inputs, dict) or '_policy_noise' not in inputs:
+        raise ValueError('Continuous policy inputs require _policy_noise.')
+      policy_noise = inputs['_policy_noise']
+    out = self._head_pass(torso, policy_noise)
     if self._model:
       root = self._model.root_embedding(torso)
-      model_out = self._model.model_step(root)
+      if continuous:
+        actions = jnp.concatenate(
+            [
+                inputs.get('_model_samples', out['logits']),
+                inputs['_model_action'][..., None],
+            ],
+            axis=-1,
+        )
+        model_out = self._model.model_step(root, actions, policy_noise)
+        out.update({key + '_a': value[:, -1] for key, value in model_out.items()})
+        model_out = {key: value[:, :-1] for key, value in model_out.items()}
+      else:
+        model_out = self._model.model_step(root)
       out.update(model_out)
     return out
 
@@ -153,6 +198,12 @@ class MLP(MLPHeadNet):
       self, inputs: chex.ArrayTree, should_reset: chex.Array | None = None
   ) -> chex.Array:
     del should_reset
+    if isinstance(inputs, dict):
+      inputs = {
+          key: value
+          for key, value in inputs.items()
+          if key not in ('_policy_noise', '_model_action', '_model_samples')
+      }
     inputs = [hk.Flatten()(x) for x in jax.tree_util.tree_leaves(inputs)]
     inputs = jnp.concatenate(inputs, axis=-1)
     return hk.nets.MLP(self._dense, name='torso')(inputs)

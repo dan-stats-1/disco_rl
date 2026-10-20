@@ -68,9 +68,29 @@ class Agent:
     self.single_action_spec = single_action_spec
     self._batch_axis_name = batch_axis_name
 
-    # This agent only supports scalar discrete action specs.
-    assert single_action_spec.dtype == np.int32
-    assert not single_action_spec.shape
+    if single_action_spec.shape:
+      raise ValueError('The agent requires scalar actions.')
+    self._continuous_actions = np.issubdtype(
+        single_action_spec.dtype, np.floating
+    )
+    if not self._continuous_actions and single_action_spec.dtype != np.int32:
+      raise ValueError('Discrete actions must have dtype int32.')
+    if self._continuous_actions and agent_settings.update_rule_name != 'disco':
+      raise ValueError('Continuous actions are currently supported by Disco only.')
+    configured_continuous = agent_settings.update_rule.get(
+        'continuous_actions', False
+    )
+    if self._continuous_actions != configured_continuous:
+      raise ValueError('The update-rule policy mode must match the action spec.')
+    if self._continuous_actions:
+      if single_action_spec.dtype != np.float32:
+        raise ValueError('Continuous actions must have dtype float32.')
+      for name, bound in (
+          ('action_minimum', single_action_spec.minimum),
+          ('action_maximum', single_action_spec.maximum),
+      ):
+        if not np.isfinite(bound) or agent_settings.update_rule[name] != bound:
+          raise ValueError(f'{name} must match the finite environment bound.')
 
     # Create the update rule.
     if agent_settings.update_rule_name == 'disco':
@@ -107,10 +127,21 @@ class Agent:
 
   def _dummy_obs(self, batch_size: int) -> chex.ArrayTree:
     """Create dummy observation for params and actor state initialisation."""
-    return jax.tree.map(
+    observation = jax.tree.map(
         lambda v: np.zeros((batch_size,) + v.shape, dtype=v.dtype),
         self.single_observation_spec,
     )
+    if self._continuous_actions:
+      observation['_policy_noise'] = np.zeros(
+          (batch_size, self.settings.update_rule.num_samples, 1), np.float32
+      )
+      midpoint = (
+          self.single_action_spec.minimum + self.single_action_spec.maximum
+      ) / 2.0
+      observation['_model_action'] = np.full(
+          (batch_size,), midpoint, dtype=np.float32
+      )
+    return observation
 
   def _dummy_act(self, batch_size: int) -> chex.Array:
     """Create dummy action for params and actor state initialisation."""
@@ -152,17 +183,54 @@ class Agent:
       actor_state: hk.State,
   ) -> tuple[types.ActorTimestep, hk.State]:
     """Compute actions for the provided timestep."""
+    observation = timestep.observation
+    if self._continuous_actions:
+      noise_rng, rng = jax.random.split(rng)
+      observation = (
+          dict(observation)
+          if isinstance(observation, dict)
+          else {'observation': observation}
+      )
+      if any(
+          key in observation
+          for key in ('_policy_noise', '_model_action', '_model_samples')
+      ):
+        raise ValueError('Environment observations contain reserved policy keys.')
+      batch_size = jax.tree.leaves(observation)[0].shape[0]
+      observation['_policy_noise'] = jax.random.uniform(
+          noise_rng,
+          (batch_size, self.settings.update_rule.num_samples, 1),
+          minval=-1.0,
+          maxval=1.0,
+      )
+      midpoint = (
+          self.single_action_spec.minimum + self.single_action_spec.maximum
+      ) / 2.0
+      observation['_model_action'] = jnp.full(
+          (batch_size,), midpoint, dtype=jnp.float32
+      )
     # Perform inference on the agent's network.
     should_reset = timestep.step_type == dm_env.StepType.LAST
     agent_outs, next_actor_state = self._network.one_step(
-        actor_params, actor_state, timestep.observation, should_reset
+        actor_params, actor_state, observation, should_reset
     )
     # Sample actions.
-    actions = distrax.Softmax(logits=agent_outs['logits']).sample(seed=rng)
+    if self._continuous_actions:
+      samples = agent_outs['logits']
+      indices = jax.random.randint(rng, samples.shape[:-1], 0, samples.shape[-1])
+      actions = jnp.take_along_axis(samples, indices[..., None], axis=-1)[..., 0]
+      observation['_model_action'] = actions
+      for key in ('z', 'q', 'aux_pi'):
+        if key in agent_outs:
+          agent_outs[key + '_a'] = jnp.take_along_axis(
+              agent_outs[key], indices[:, None, None], axis=1
+          )[:, 0]
+    else:
+      actions = distrax.Softmax(logits=agent_outs['logits']).sample(seed=rng)
 
     # Return the actor timestep.
     actor_timestep = types.ActorTimestep(
-        observations=timestep.observation,
+        observations=observation,
         actions=actions,
         agent_outs=agent_outs,
         rewards=timestep.reward,
@@ -316,7 +384,15 @@ class Agent:
     return learner_state, last_agent_net_state, logging_dict
 
 
-def get_settings_disco():
+def get_settings_disco(
+    *,
+    continuous_actions: bool = False,
+    num_samples: int = 32,
+    kde_bandwidth: float = 0.1,
+    wasserstein_smoothing: float = 0.05,
+    action_minimum: float = -1.0,
+    action_maximum: float = 1.0,
+):
   """Disco-103 setting."""
   return config_dict.ConfigDict(
       dict(
@@ -351,12 +427,18 @@ def get_settings_disco():
                           pred_embedding_size=(16, 1),
                           hidden_size=128,
                       ),
-                      input_option=disco.get_input_option(),
+                      input_option=disco.get_input_option(continuous_actions),
                   )
               ),
               value_discount=0.997,
               num_bins=601,
               max_abs_value=300.0,
+              continuous_actions=continuous_actions,
+              num_samples=num_samples,
+              kde_bandwidth=kde_bandwidth,
+              wasserstein_smoothing=wasserstein_smoothing,
+              action_minimum=action_minimum,
+              action_maximum=action_maximum,
           ),
           # optimizer.
           learning_rate=0.0003,

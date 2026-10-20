@@ -15,6 +15,8 @@
 
 """DiscoRL update rule."""
 
+import math
+
 import chex
 import distrax
 import haiku as hk
@@ -25,6 +27,7 @@ import rlax
 
 from disco_rl import types
 from disco_rl import utils
+from disco_rl import continuous_policies
 from disco_rl.networks import meta_nets
 from disco_rl.update_rules import base
 from disco_rl.value_fns import value_utils
@@ -41,6 +44,12 @@ class DiscoUpdateRule(base.UpdateRule):
       num_bins: int,
       moving_average_decay: float = 0.99,
       moving_average_eps: float = 1e-6,
+      continuous_actions: bool = False,
+      num_samples: int = 32,
+      kde_bandwidth: float = 0.1,
+      wasserstein_smoothing: float = 0.05,
+      action_minimum: float = -1.0,
+      action_maximum: float = 1.0,
   ) -> None:
     """The meta-network constructor."""
     super().__init__()
@@ -48,6 +57,26 @@ class DiscoUpdateRule(base.UpdateRule):
     self._value_discount = value_discount
     self._max_abs_value = max_abs_value
     self._num_bins = num_bins
+    if not isinstance(num_samples, int) or num_samples < 2:
+      raise ValueError('num_samples must be an integer greater than one.')
+    for name, value in (
+        ('kde_bandwidth', kde_bandwidth),
+        ('wasserstein_smoothing', wasserstein_smoothing),
+    ):
+      if not math.isfinite(value) or value <= 0:
+        raise ValueError(f'{name} must be finite and positive.')
+    if (
+        not math.isfinite(action_minimum)
+        or not math.isfinite(action_maximum)
+        or action_minimum >= action_maximum
+    ):
+      raise ValueError('Action bounds must be finite and strictly increasing.')
+    self._continuous_actions = continuous_actions
+    self._num_samples = num_samples
+    self._kde_bandwidth = kde_bandwidth
+    self._wasserstein_smoothing = wasserstein_smoothing
+    self._action_minimum = action_minimum
+    self._action_maximum = action_maximum
 
     # Exponential moving averages.
     self._adv_ema = utils.MovingAverage(
@@ -60,7 +89,13 @@ class DiscoUpdateRule(base.UpdateRule):
     # Meta-network.
     def meta_net_fn(*args, **kwargs):
       if net['name'] == 'lstm':
-        return meta_nets.LSTM(**net)(*args, **kwargs)
+        return meta_nets.LSTM(
+            **net,
+            continuous_actions=continuous_actions,
+            kde_bandwidth=kde_bandwidth,
+            action_minimum=action_minimum,
+            action_maximum=action_maximum,
+        )(*args, **kwargs)
       else:
         raise ValueError(f'Invalid model network name: {net["name"]}.')
 
@@ -96,7 +131,11 @@ class DiscoUpdateRule(base.UpdateRule):
       self, single_action_spec: types.ActionSpec
   ) -> types.Specs:
     return dict(
-        logits=utils.get_logits_specs(single_action_spec),
+        logits=(
+            types.ArraySpec((self._num_samples,), jnp.float32)
+            if self._continuous_actions
+            else utils.get_logits_specs(single_action_spec)
+        ),
         y=types.ArraySpec((self._prediction_size,), jnp.float32),
     )
 
@@ -105,7 +144,11 @@ class DiscoUpdateRule(base.UpdateRule):
   ) -> types.Specs:
     return dict(
         z=types.ArraySpec((self._prediction_size,), jnp.float32),
-        aux_pi=utils.get_logits_specs(single_action_spec),
+        aux_pi=(
+            types.ArraySpec((self._num_samples,), jnp.float32)
+            if self._continuous_actions
+            else utils.get_logits_specs(single_action_spec)
+        ),
         q=types.ArraySpec((self._num_bins,), jnp.float32),
     )
 
@@ -130,10 +173,17 @@ class DiscoUpdateRule(base.UpdateRule):
     )
 
     # Unroll the target policy.
+    target_observations = rollout.observations
+    if self._continuous_actions:
+      target_observations = dict(target_observations)
+      # Compare Q and z at the same actions, and estimate V under the online pi.
+      target_observations['_model_samples'] = jax.lax.stop_gradient(
+          rollout.agent_out['logits']
+      )
     target_out, _ = unroll_policy_fn(
         meta_state['target_params'],
         state,
-        rollout.observations,
+        target_observations,
         rollout.should_reset_mask_fwd,
     )
 
@@ -156,6 +206,16 @@ class DiscoUpdateRule(base.UpdateRule):
         td_ema_state=meta_state['td_ema_state'],
         td_ema_fn=self._td_ema,
         axis_name=axis_name,
+        continuous_actions=self._continuous_actions,
+        kde_bandwidth=self._kde_bandwidth,
+        action_minimum=self._action_minimum,
+        action_maximum=self._action_maximum,
+        q_action_net_out=(
+            rollout.agent_out['q_a'] if self._continuous_actions else None
+        ),
+        target_q_action_net_out=(
+            target_out['q_a'] if self._continuous_actions else None
+        ),
     )
 
     # Apply the meta-network.
@@ -229,7 +289,10 @@ class DiscoUpdateRule(base.UpdateRule):
     logits = agent_out['logits']
     y = agent_out['y']
     z = agent_out['z']
-    z_a = utils.batch_lookup(agent_out['z'], actions)
+    z_a = (
+        agent_out['z_a'] if self._continuous_actions
+        else utils.batch_lookup(agent_out['z'], actions)
+    )
 
     # Parse the meta-net's output.
     pi_hat = meta_out['pi']
@@ -242,17 +305,32 @@ class DiscoUpdateRule(base.UpdateRule):
     chex.assert_equal_shape([pi_hat, logits])  # [T, B, A]
     chex.assert_equal_shape([y_hat, y])  # [T, B, Y]
     chex.assert_equal_shape([z_hat, z_a])  # [T, B, Z]
-    pi_loss_per_step = rlax.categorical_kl_divergence(pi_hat, logits)
+    pi_loss_per_step = (
+        continuous_policies.smooth_wasserstein_1(
+            pi_hat, logits, self._wasserstein_smoothing
+        ) if self._continuous_actions
+        else rlax.categorical_kl_divergence(pi_hat, logits)
+    )
     y_loss_per_step = rlax.categorical_kl_divergence(y_hat, y)
     z_loss_per_step = rlax.categorical_kl_divergence(z_hat, z_a)
 
     # Compute auxiliary 1-step policy prediction loss.
     aux_pi = rollout.agent_out['aux_pi'][:-1]  # [T, B, A, A]
-    aux_pi_a = utils.batch_lookup(aux_pi, actions)  # [T, B, A]
-    aux_policy_target = rollout.agent_out['logits'][1:]  # [T, B, A]
-    aux_policy_loss_per_step = rlax.categorical_kl_divergence(
-        jax.lax.stop_gradient(aux_policy_target), aux_pi_a
+    aux_pi_a = (
+        agent_out['aux_pi_a'] if self._continuous_actions
+        else utils.batch_lookup(aux_pi, actions)
     )
+    aux_policy_target = rollout.agent_out['logits'][1:]  # [T, B, A]
+    if self._continuous_actions:
+      aux_policy_loss_per_step = continuous_policies.smooth_wasserstein_1(
+          jax.lax.stop_gradient(aux_policy_target),
+          aux_pi_a,
+          self._wasserstein_smoothing,
+      )
+    else:
+      aux_policy_loss_per_step = rlax.categorical_kl_divergence(
+          jax.lax.stop_gradient(aux_policy_target), aux_pi_a
+      )
     # Mask out terminal states.
     aux_policy_loss_per_step *= 1.0 - rollout.is_terminal
 
@@ -273,11 +351,21 @@ class DiscoUpdateRule(base.UpdateRule):
         + hyper_params['aux_policy_cost'] * aux_policy_loss_per_step
     )
 
+    def policy_entropy(samples):
+      if self._continuous_actions:
+        return continuous_policies.kde_entropy(
+            samples,
+            self._kde_bandwidth,
+            self._action_minimum,
+            self._action_maximum,
+        )
+      return distrax.Softmax(samples).entropy()
+
     log = dict(
         logits=jnp.mean(logits),
         y=jnp.mean(y),
         z=jnp.mean(z),
-        entropy=jnp.mean(distrax.Softmax(logits).entropy()),
+        entropy=jnp.mean(policy_entropy(logits)),
         y_entropy=jnp.mean(distrax.Softmax(y).entropy()),
         z_entropy=jnp.mean(distrax.Softmax(z_a).entropy()),
         pi_loss=jnp.mean(pi_loss_per_step),
@@ -285,10 +373,10 @@ class DiscoUpdateRule(base.UpdateRule):
         pi_hat=jnp.mean(pi_hat),
         y_hat=jnp.mean(y_hat),
         z_hat=jnp.mean(z_hat),
-        pi_hat_entropy=jnp.mean(distrax.Softmax(pi_hat).entropy()),
-        aux_policy_entropy=jnp.mean(distrax.Softmax(aux_pi_a).entropy()),
+        pi_hat_entropy=jnp.mean(policy_entropy(pi_hat)),
+        aux_policy_entropy=jnp.mean(policy_entropy(aux_pi_a)),
         aux_target_entropy=jnp.mean(
-            distrax.Softmax(aux_policy_target).entropy()
+            policy_entropy(aux_policy_target)
         ),
     )
     return total_loss_per_step, log
@@ -303,7 +391,10 @@ class DiscoUpdateRule(base.UpdateRule):
     assert meta_out is not None
     td = meta_out['q_td']
 
-    q_a = utils.batch_lookup(rollout.agent_out['q'], rollout.actions)[:-1]
+    q_a = (
+        rollout.agent_out['q_a'] if self._continuous_actions
+        else utils.batch_lookup(rollout.agent_out['q'], rollout.actions)
+    )[:-1]
     value_loss_per_step = value_utils.value_loss_from_td(
         value_net_out=q_a,
         td=jax.lax.stop_gradient(td),
@@ -323,7 +414,9 @@ class DiscoUpdateRule(base.UpdateRule):
     return loss_per_step, log
 
 
-def get_input_option() -> types.MetaNetInputOption:
+def get_input_option(
+    continuous_actions: bool = False,
+) -> types.MetaNetInputOption:
   """Returns the input option for the meta-network.
 
   Detailed description can be found in the paper.
@@ -331,7 +424,7 @@ def get_input_option() -> types.MetaNetInputOption:
   Returns:
     The input option for the meta-network.
   """
-  return types.MetaNetInputOption(
+  option = types.MetaNetInputOption(
       base=(
           types.TransformConfig(
               source='agent_out/logits',
@@ -424,5 +517,27 @@ def get_input_option() -> types.MetaNetInputOption:
               source='extra_from_rule/normalized_qv_adv',
               transforms=('drop_last', 'stop_grad'),
           ),
+      ),
+  )
+  if not continuous_actions:
+    return option
+
+  def continuous_config(config):
+    source = config.source
+    transforms = list(config.transforms)
+    if source.endswith('/logits'):
+      transforms = [tx for tx in transforms if tx != 'softmax']
+      transforms = [
+          'log_prob_a' if tx == 'select_a' else tx for tx in transforms
+      ]
+    elif source.endswith('/z') and 'select_a' in transforms:
+      source += '_a'
+      transforms.remove('select_a')
+    return types.TransformConfig(source=source, transforms=tuple(transforms))
+
+  return types.MetaNetInputOption(
+      base=tuple(continuous_config(config) for config in option.base),
+      action_conditional=tuple(
+          continuous_config(config) for config in option.action_conditional
       ),
   )

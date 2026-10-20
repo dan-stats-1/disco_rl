@@ -73,15 +73,38 @@ class LSTMModel:
     return lstm_output
 
   def _model_head_pass(
-      self, transition_output: chex.Array
+      self,
+      transition_output: chex.Array,
+      num_actions: int | None = None,
+      policy_noise: chex.Array | None = None,
   ) -> dict[str, chex.Array]:
     """Gets outputs from MLPs with shapes according to out spec."""
     # transition_output has shape [BA, ...]
-    num_actions = utils.get_num_actions_from_spec(self._action_spec)
+    if num_actions is None:
+      num_actions = utils.get_num_actions_from_spec(self._action_spec)
     batch_size = transition_output.shape[0] // num_actions
 
     model_outputs = dict()
     for key, pred_spec in self._out_spec.items():
+      if key == 'aux_pi' and policy_noise is not None:
+        num_samples = policy_noise.shape[1]
+        hidden = transition_output.reshape(batch_size, num_actions, -1)
+        hidden = jnp.broadcast_to(
+            hidden[:, :, None, :],
+            (batch_size, num_actions, num_samples, hidden.shape[-1]),
+        )
+        noise = jnp.broadcast_to(
+            policy_noise[:, None, :, :],
+            (batch_size, num_actions, num_samples, policy_noise.shape[-1]),
+        )
+        pred = hk.nets.MLP(
+            self._head_mlp_hiddens + (1,), name='aux_policy_generator'
+        )(jnp.concatenate([hidden, noise], axis=-1))[..., 0]
+        minimum, maximum = self._action_spec.minimum, self._action_spec.maximum
+        model_outputs[key] = minimum + (maximum - minimum) * (
+            jnp.tanh(pred) + 1.0
+        ) / 2.0
+        continue
       pred = hk.nets.MLP(self._head_mlp_hiddens + (np.prod(pred_spec.shape),))(
           transition_output
       )
@@ -91,8 +114,29 @@ class LSTMModel:
 
     return model_outputs
 
-  def model_step(self, embedding: hk.LSTMState) -> dict[str, chex.Array]:
+  def model_step(
+      self,
+      embedding: hk.LSTMState,
+      actions: chex.Array | None = None,
+      policy_noise: chex.Array | None = None,
+  ) -> dict[str, chex.Array]:
     """Steps model."""
+    if actions is not None:
+      num_actions = actions.shape[-1]
+      minimum, maximum = self._action_spec.minimum, self._action_spec.maximum
+      normalized = 2.0 * (actions - minimum) / (maximum - minimum) - 1.0
+      action_embed = hk.Linear(16, name='continuous_action_embed')(
+          normalized.reshape(-1, 1)
+      )
+      states = jax.tree.map(
+          lambda x: jnp.repeat(x, num_actions, axis=0), embedding
+      )
+      transition_output, _ = hk.LSTM(self._lstm_size, name='action_cond')(
+          action_embed, states
+      )
+      return self._model_head_pass(
+          transition_output, num_actions, policy_noise
+      )
     transition_output = self._model_transition_all_actions(embedding)
     model_outputs = self._model_head_pass(transition_output)
     return model_outputs
