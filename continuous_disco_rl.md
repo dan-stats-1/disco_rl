@@ -11,8 +11,8 @@ The current Disco RL methodology is focussed on discrete action spaces. Presente
 
 3. Bounded Gaussian KDE is used for policy density estimates. Write $\tilde{\pi}_{\theta}$ for the current policy's estimated density and $\tilde{\mu}$ for the behaviour policy's estimated density. Density usage is highlighted in magenta:
 
-* Advantage actor-critic gradient: $$\nabla_{\theta_k}J(\theta_k) \approx \mathbb{E}\left[\sum_t \gamma^t \hat{A}_t \nabla_{\theta_k}\log\tilde{\pi}_{\theta_k}(a_t\mid s_t)\right]$$
-* Policy differential entropy estimate: $$\widehat{H}(\pi_{\theta}(\cdot\mid s)) = -\frac{1}{N}\sum_{i=1}^{N}\log\tilde{\pi}_{\theta}(a_i\mid s), \qquad a_i\sim\pi_{\theta}(\cdot\mid s)$$
+* Advantage actor-critic gradient: $$\nabla_{\theta_k}J(\theta_k) \approx \mathbf{E}\left[\sum_t \gamma^t \hat{A}_t \nabla_{\theta_k}\log\tilde{\pi}_{\theta_k}(a_t\mid s_t)\right]$$
+* Policy differential entropy estimate: $$\hat{H}(\pi_{\theta}(\cdot\mid s)) = -\frac{1}{N}\sum_{i=1}^{N}\log\tilde{\pi}_{\theta}(a_i\mid s), \qquad a_i\sim\pi_{\theta}(\cdot\mid s)$$
 * V-trace and RETRACE density ratio : $$\rho_t=\frac{\tilde{\pi}_{\theta}(a_t\mid s_t)}{\tilde{\mu}(a_t\mid s_t)}$$
 
 4. Policy matching and auxiliary next-policy matching now use a smooth approximation to empirical Wasserstein-1:
