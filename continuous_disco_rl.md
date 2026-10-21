@@ -9,7 +9,7 @@ The current Disco RL methodology is focussed on discrete action spaces. Presente
 
 2. $z_{\theta}(s,a)$, $q_{\theta}(s,a)$, $p_{\theta}(s,a)$ now accept a continuous action argument $a$. The $y$ and $z$ outputs remain categorical latent predictions, and $q$ retains categorical return bins. Their categorical losses and the categorical entropy of $y$ and $z$ remain unchanged.
 
-3. Bounded Gaussian KDE is used for policy density estimates. Write $\tilde{\pi}_{\theta}$ for the current policy's estimated density and $\tilde{\mu}$ for the behaviour policy's estimated density. Density usage is highlighted in magenta:
+3. Bounded Gaussian KDE is used for policy density estimates. Write $\tilde{\pi}_{\theta}$ for the current policy's estimated density and $\tilde{\mu}$ for the behaviour policy's estimated density:
 
 * Advantage actor-critic gradient: 
 
@@ -24,8 +24,11 @@ $$\hat{H}(\pi_{\theta}(\cdot\mid s)) = -\frac{1}{N}\sum_{i=1}^{N}\log\tilde{\pi}
 $$\rho_t=\frac{\tilde{\pi}_{\theta}(a_t\mid s_t)}{\tilde{\mu}(a_t\mid s_t)}$$
 
 4. Policy matching and auxiliary next-policy matching now use a smooth approximation to empirical Wasserstein-1:
+
 $$D_{W_{\tau}}(a_{1:N},b_{1:N})=\frac{1}{N}\sum_{i=1}^{N}\left[\sqrt{(a_{(i)}-b_{(i)})^2+\tau^2}-\tau\right], \qquad \tau>0$$
+
 Here $a_{(i)}$ and $b_{(i)}$ are independently sorted samples.
+
 $$L_{\pi}=D_{W_{\tau}}(\pi,\hat{\pi}), \qquad L_p=D_{W_{\tau}}(p,(\hat{p}))$$
 
 Also $L_{\mathrm{KL}}=D_{\mathrm{KL}}(\pi_{\theta^-}\Vert\hat{\pi})$ in meta-optimisation stabilisation becomes
