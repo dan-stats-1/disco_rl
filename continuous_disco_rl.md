@@ -39,5 +39,5 @@ $$a_{\mathrm{norm}}=2\frac{a-a_{\min}}{a_{\max}-a_{\min}}-1, \qquad e_a=W_a a_{\
 
 ### Results
 
-![](reults_continuous_catch.png)
+![](results_continuous_catch.png)
 
