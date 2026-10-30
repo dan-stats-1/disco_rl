@@ -1,3 +1,7 @@
+# Continuous action space research
+
+I adapted the DiscoRL approach to continuous action spaces utilising KDE-based density estimates and smoothed 1D Wasserstein-1 distances. It didn't learn an effective rule for continuous catch. See `continuous_disco_rl.md` for the method and results.
+
 # DiscoRL: Discovering State-of-the-art Reinforcement Learning Algorithms
 
 This repository contains accompanying code for the *"Discovering
