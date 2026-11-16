@@ -369,6 +369,8 @@ class DiscoUpdateRule(base.UpdateRule):
         y_entropy=jnp.mean(distrax.Softmax(y).entropy()),
         z_entropy=jnp.mean(distrax.Softmax(z_a).entropy()),
         pi_loss=jnp.mean(pi_loss_per_step),
+        y_loss=jnp.mean(y_loss_per_step),
+        z_loss=jnp.mean(z_loss_per_step),
         aux_kl_loss=jnp.mean(aux_policy_loss_per_step),
         pi_hat=jnp.mean(pi_hat),
         y_hat=jnp.mean(y_hat),

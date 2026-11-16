@@ -1,0 +1,61 @@
+case,bandwidth,check,error,tolerance,passed
+interior,0.03,density integrates to one,0.0,0.003,True
+interior,0.03,independent truncated-normal reference,6.089900640177799e-08,2e-05,True
+interior,0.03,zero density outside bounds,0.0,0.0,True
+interior,0.03,bank permutation invariance,0.0,2e-05,True
+interior,0.1,density integrates to one,0.0,0.003,True
+interior,0.1,independent truncated-normal reference,5.516456459045062e-08,2e-05,True
+interior,0.1,zero density outside bounds,0.0,0.0,True
+interior,0.1,bank permutation invariance,0.0,2e-05,True
+interior,0.3,density integrates to one,0.0,0.003,True
+interior,0.3,independent truncated-normal reference,4.884156079367212e-08,2e-05,True
+interior,0.3,zero density outside bounds,0.0,0.0,True
+interior,0.3,bank permutation invariance,0.0,2e-05,True
+boundary,0.03,density integrates to one,2.8014183044433594e-06,0.003,True
+boundary,0.03,independent truncated-normal reference,1.3218607378750415e-07,2e-05,True
+boundary,0.03,zero density outside bounds,0.0,0.0,True
+boundary,0.03,bank permutation invariance,0.0,2e-05,True
+boundary,0.1,density integrates to one,2.384185791015625e-07,0.003,True
+boundary,0.1,independent truncated-normal reference,4.459323356698119e-08,2e-05,True
+boundary,0.1,zero density outside bounds,0.0,0.0,True
+boundary,0.1,bank permutation invariance,0.0,2e-05,True
+boundary,0.3,density integrates to one,0.0,0.003,True
+boundary,0.3,independent truncated-normal reference,8.531308127397652e-08,2e-05,True
+boundary,0.3,zero density outside bounds,0.0,0.0,True
+boundary,0.3,bank permutation invariance,0.0,2e-05,True
+outside_centres,0.03,density integrates to one,8.666515350341797e-05,0.003,True
+outside_centres,0.03,independent truncated-normal reference,1.6981153312500715e-07,2e-05,True
+outside_centres,0.03,zero density outside bounds,0.0,0.0,True
+outside_centres,0.03,bank permutation invariance,0.0,2e-05,True
+outside_centres,0.1,density integrates to one,9.5367431640625e-07,0.003,True
+outside_centres,0.1,independent truncated-normal reference,1.7966095586476657e-07,2e-05,True
+outside_centres,0.1,zero density outside bounds,0.0,0.0,True
+outside_centres,0.1,bank permutation invariance,0.0,2e-05,True
+outside_centres,0.3,density integrates to one,0.0,0.003,True
+outside_centres,0.3,independent truncated-normal reference,1.1687085688278958e-07,2e-05,True
+outside_centres,0.3,zero density outside bounds,0.0,0.0,True
+outside_centres,0.3,bank permutation invariance,0.0,2e-05,True
+derivatives,0.03,log-density sample gradient,2.1804988136864267e-05,0.005,True
+derivatives,0.03,entropy sample/query gradient,5.933908687438816e-05,0.005,True
+derivatives,0.03,policy-score sample gradient,2.2528374756802805e-05,0.005,True
+derivatives,0.03,log-density query gradient,1.994716348401851e-05,0.005,True
+derivatives,0.03,second derivative directional check,6.973992640268989e-06,0.02,True
+derivatives,0.03,policy-score query is detached,0.0,0.0,True
+derivatives,0.03,policy-score advantage is detached,0.0,0.0,True
+execution,0.03,JIT versus eager,0.0,2e-05,True
+derivatives,0.1,log-density sample gradient,4.223435098538175e-05,0.005,True
+derivatives,0.1,entropy sample/query gradient,1.0092784577864222e-05,0.005,True
+derivatives,0.1,policy-score sample gradient,4.2205501813441515e-05,0.005,True
+derivatives,0.1,log-density query gradient,0.00023566580255872396,0.005,True
+derivatives,0.1,second derivative directional check,0.00016241823323071003,0.02,True
+derivatives,0.1,policy-score query is detached,0.0,0.0,True
+derivatives,0.1,policy-score advantage is detached,0.0,0.0,True
+execution,0.1,JIT versus eager,0.0,2e-05,True
+derivatives,0.3,log-density sample gradient,2.1519794245250523e-05,0.005,True
+derivatives,0.3,entropy sample/query gradient,3.285438288003206e-05,0.005,True
+derivatives,0.3,policy-score sample gradient,2.4372564439545386e-05,0.005,True
+derivatives,0.3,log-density query gradient,1.705722889820112e-05,0.005,True
+derivatives,0.3,second derivative directional check,3.551329791662283e-05,0.02,True
+derivatives,0.3,policy-score query is detached,0.0,0.0,True
+derivatives,0.3,policy-score advantage is detached,0.0,0.0,True
+execution,0.3,JIT versus eager,0.0,2e-05,True

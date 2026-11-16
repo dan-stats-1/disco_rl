@@ -1,0 +1,4 @@
+training_transitions,training_seed,episode_seed,episode_steps,episode_return,caught
+0,302,0,7,-1.0,False
+12288,302,0,7,-1.0,False
+409600,302,0,7,1.0,True

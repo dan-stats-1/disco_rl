@@ -1,0 +1,7 @@
+seed,update,env_steps,mode,mean_return,catch_rate,episodes,teacher_seed
+401,0,0,teacher_deterministic,1.0,1.0,576,302
+401,0,0,teacher_stochastic,0.9097222222222222,0.9548611111111112,576,302
+402,0,0,teacher_deterministic,1.0,1.0,576,302
+402,0,0,teacher_stochastic,0.9131944444444444,0.9565972222222222,576,302
+403,0,0,teacher_deterministic,1.0,1.0,576,302
+403,0,0,teacher_stochastic,0.9340277777777778,0.9670138888888888,576,302
