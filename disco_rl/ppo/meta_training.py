@@ -1,6 +1,6 @@
 """Discover Disco targets using a frozen PPO outer objective."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 
@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 from ml_collections import config_dict
+import numpy as np
 import optax
 import pandas as pd
 
@@ -20,6 +21,10 @@ from disco_rl.ppo.imitation import ImitationConfig
 from disco_rl.ppo.imitation import ImitationTrainer
 from disco_rl.ppo.training import PPOResult
 from disco_rl.ppo.training import _finite_metrics
+
+
+_META_ADAM_B1 = 0.9
+_META_ADAM_B2 = 0.999
 
 
 @dataclass(frozen=True)
@@ -91,7 +96,8 @@ class MetaTrainingTrainer:
         self._collect_validation(params, state, ts, env_state, key)
     )
     self.meta_optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0), optax.adam(config.meta_learning_rate)
+        optax.clip_by_global_norm(1.0),
+        optax.adam(config.meta_learning_rate, b1=_META_ADAM_B1, b2=_META_ADAM_B2),
     )
     self.gradient = jax.jit(jax.value_and_grad(self.outer_loss, has_aux=True))
     self.apply_rule = jax.jit(self._apply_rule)
@@ -173,6 +179,92 @@ class MetaTrainingResult:
   initial_meta_params: hk.Params
   final_meta_params: hk.Params
   final_params: dict[int, hk.Params]
+  adam_diagnostics: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _adam_moment_diagnostics(opt_state, updates, learning_rate, update):
+  """Summarise post-update Adam buffers without retaining parameter-sized history."""
+  first = optax.tree_utils.tree_get(opt_state, 'mu')
+  second = optax.tree_utils.tree_get(opt_state, 'nu')
+  count = optax.tree_utils.tree_get(opt_state, 'count')
+  if first is None or second is None or count is None:
+    raise RuntimeError('Expected one outer Adam state with mu, nu and count.')
+  if int(count) != update:
+    raise RuntimeError('Outer Adam count does not match the recorded meta-update.')
+  corrected_first = optax.tree.bias_correction(first, _META_ADAM_B1, count)
+  corrected_second = optax.tree.bias_correction(second, _META_ADAM_B2, count)
+  quantities = {
+      'u': first,
+      'sqrt_v': jax.tree.map(jnp.sqrt, second),
+      'u_hat': corrected_first,
+      'sqrt_v_hat': jax.tree.map(jnp.sqrt, corrected_second),
+      # Use the actual optimiser output, including its epsilon and sign convention.
+      'effective_ratio': jax.tree.map(lambda delta: -delta / learning_rate, updates),
+  }
+  rows = []
+
+  def record(quantity, tensor, values):
+    if not np.isfinite(values).all():
+      raise FloatingPointError(f'Non-finite outer Adam {quantity} at update {update}.')
+    rows.append(dict(
+        update=update, adam_count=int(count), quantity=quantity, tensor=tensor,
+        coordinates=values.size, mean=float(values.mean()),
+        rms=float(np.sqrt(np.mean(values**2))),
+        minimum=float(values.min()), p05=float(np.quantile(values, 0.05)),
+        median=float(np.median(values)), p95=float(np.quantile(values, 0.95)),
+        maximum=float(values.max()),
+    ))
+
+  for quantity, tree in quantities.items():
+    arrays = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+      values = np.asarray(leaf, dtype=np.float64).ravel()
+      record(quantity, jax.tree_util.keystr(path), values)
+      arrays.append(values)
+    record(quantity, '__all__', np.concatenate(arrays))
+  return rows
+
+
+def plot_meta_adam_diagnostics(result: MetaTrainingResult) -> Figure:
+  """Plot coordinate summaries, not a misleading single signed moment average."""
+  if result.adam_diagnostics.empty:
+    raise ValueError(
+        'No Adam history was recorded. Reload meta_training and rerun train_meta; '
+        'old training.csv files cannot reconstruct optimiser moments.'
+    )
+  history = result.adam_diagnostics
+  global_history = history[history.tensor == '__all__']
+  fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+  for axis, quantity, title in zip(
+      axes[0], ('u', 'sqrt_v', 'effective_ratio'),
+      ('First moment u (signed)', 'Square-root second moment sqrt(v)',
+       'Actual bias-corrected ratio: -eta update / outer rate'),
+  ):
+    group = global_history[global_history.quantity == quantity]
+    axis.plot(group['update'], group['median'], label='Coordinate median')
+    axis.fill_between(group['update'], group.p05, group.p95, alpha=0.2, label='5th-95th percentiles')
+    axis.plot(group['update'], group['mean'], label='Coordinate mean', linestyle='--')
+    axis.set(title=title, xlabel='Meta-update')
+    axis.set_yscale('symlog', linthresh=1e-10)
+    axis.legend(fontsize=8)
+  for quantity in ('u', 'sqrt_v', 'u_hat', 'sqrt_v_hat'):
+    group = global_history[global_history.quantity == quantity]
+    axes[1, 0].plot(group['update'], group.rms, label=quantity)
+  axes[1, 0].set(title='Raw vs bias-corrected RMS', xlabel='Meta-update')
+  axes[1, 0].set_yscale('symlog', linthresh=1e-10)
+  axes[1, 0].legend(fontsize=8)
+  axes[1, 1].plot(result.training['update'], result.training.meta_loss)
+  axes[1, 1].set(title='Outer PPO distance (before eta update)', xlabel='Meta-update')
+  for quantity, label in (
+      ('meta_gradient_norm', 'Raw meta-gradient L2'),
+      ('meta_update_norm', 'Applied eta-update L2'),
+  ):
+    axes[1, 2].plot(result.training['update'], result.training[quantity], label=label)
+  axes[1, 2].set(title='Gradient and update norms', xlabel='Meta-update')
+  axes[1, 2].set_yscale('symlog', linthresh=1e-10)
+  axes[1, 2].legend(fontsize=8)
+  fig.tight_layout()
+  return fig
 
 
 def _initial_student(trainer, seed):
@@ -197,7 +289,7 @@ def train_meta(
   initial_meta_params = meta_params
   opt_state = trainer.meta_optimizer.init(meta_params)
   states = [_initial_student(trainer, seed) for seed in config.seeds]
-  train_rows, eval_rows = [], []
+  train_rows, eval_rows, adam_rows = [], [], []
   for seed, state in zip(config.seeds, states):
     eval_rows.extend(trainer.evaluation_rows(state[0].params, seed, 0, 0, 'meta_train'))
 
@@ -227,11 +319,19 @@ def train_meta(
       )
     grad = jax.tree.map(lambda *xs: jnp.stack(xs).mean(0), *gradients)
     updates, opt_state = trainer.meta_optimizer.update(grad, opt_state, meta_params)
+    adam_summary = _adam_moment_diagnostics(
+        opt_state, updates, config.meta_learning_rate, update
+    )
+    adam_rows.extend(adam_summary)
     metrics = jax.tree.map(lambda *xs: jnp.stack(xs).mean(0), *logs)
     metrics.update(
         meta_gradient_norm=optax.global_norm(grad),
         meta_update_norm=optax.global_norm(updates),
     )
+    metrics.update({
+        f"adam_{row['quantity']}_rms": row['rms']
+        for row in adam_summary if row['tensor'] == '__all__'
+    })
     scalars = _finite_metrics(metrics, f'PPO outer meta-update {update}')
     if scalars['valid_transitions'] == 0:
       raise RuntimeError('No valid outer-loss positions; increase rollout_len.')
@@ -246,7 +346,10 @@ def train_meta(
       print(
           f"meta-update={update} transitions={env_steps:,} "
           f"outer W={scalars['meta_loss']:.6f} "
-          f"meta-gradient={scalars['meta_gradient_norm']:.6g}"
+          f"meta-gradient={scalars['meta_gradient_norm']:.6g} "
+          f"Adam u RMS={scalars['adam_u_rms']:.3g} "
+          f"sqrt(v) RMS={scalars['adam_sqrt_v_rms']:.3g} "
+          f"ratio RMS={scalars['adam_effective_ratio_rms']:.3g}"
       )
 
   fresh_rows = []
@@ -279,10 +382,12 @@ def train_meta(
       trainer, pd.DataFrame(train_rows), pd.DataFrame(eval_rows),
       pd.DataFrame(fresh_rows), initial_meta_params, meta_params,
       {seed: state[0].params for seed, state in zip(config.seeds, states)},
+      pd.DataFrame(adam_rows),
   )
 
 
 def save_meta_results(result: MetaTrainingResult, output_dir: Path) -> Figure:
+  """Save outer loss and individual/mean Catch curves for each action mode."""
   fig, axes = plt.subplots(1, 3, figsize=(17, 4))
   axes[0].plot(result.training.env_steps, result.training.meta_loss)
   axes[0].set(
@@ -296,18 +401,33 @@ def save_meta_results(result: MetaTrainingResult, output_dir: Path) -> Figure:
     for mode, group in frame.groupby('mode'):
       summary = group.groupby('env_steps').catch_rate.agg(['mean', 'std'])
       spread = summary['std'].fillna(0)
-      ax.plot(summary.index, summary['mean'], label=mode)
+      linestyle = '--' if mode == 'student_mean_action' else '-'
+      for index, (seed, student) in enumerate(group.groupby('seed')):
+        student = student.sort_values('env_steps')
+        ax.plot(
+            student.env_steps, student.catch_rate,
+            color=plt.get_cmap('tab10')(index % 10), linestyle=linestyle,
+            linewidth=1, alpha=0.7, label=f'Agent {seed}: {mode}',
+        )
+      ax.plot(
+          summary.index, summary['mean'], color='black', linestyle=linestyle,
+          linewidth=2.5, label=f'Mean: {mode}',
+      )
       ax.fill_between(
           summary.index, summary['mean'] - spread,
-          summary['mean'] + spread, alpha=0.15,
+          summary['mean'] + spread, color='black', alpha=0.10,
       )
     ax.set(title=title, xlabel='Environment transitions', ylabel='Catch rate', ylim=(0, 1))
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=6, ncol=2)
   fig.tight_layout()
   output_dir.mkdir(parents=True, exist_ok=True)
   result.training.to_csv(output_dir / 'training.csv', index=False)
   result.evaluation.to_csv(output_dir / 'evaluation.csv', index=False)
   result.fresh_evaluation.to_csv(output_dir / 'fresh_evaluation.csv', index=False)
   fig.savefig(output_dir / 'learning_curves.png', dpi=150)
+  if not result.adam_diagnostics.empty:
+    result.adam_diagnostics.to_csv(output_dir / 'adam_diagnostics.csv', index=False)
+    adam_fig = plot_meta_adam_diagnostics(result)
+    adam_fig.savefig(output_dir / 'adam_diagnostics.png', dpi=150)
   print(f'PPO-guided meta-training results saved to {output_dir}')
   return fig
