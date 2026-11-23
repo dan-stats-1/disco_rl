@@ -1,8 +1,9 @@
-"""Aggregate session/application features and compare feature distributions."""
+"""Aggregate session features, fit stability weights, and rank reference matches."""
 
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 import math
+from itertools import combinations
 from typing import TypeAlias
 
 import pandas as pd
@@ -125,6 +126,218 @@ def aggregate_sessions(
   fingerprints = groups.agg(aggregations)
   fingerprints['event_count'] = groups.size()
   return fingerprints
+
+
+def _validate_fingerprints(
+    fingerprints: pd.DataFrame,
+    categorical_features: Sequence[str],
+    numeric_scales: Mapping[str, float],
+) -> list[str]:
+  features = [*categorical_features, *numeric_scales]
+  if not features or len(set(features)) != len(features):
+    raise ValueError('Provide nonempty, nonoverlapping feature lists.')
+  if (
+      not isinstance(fingerprints.index, pd.MultiIndex)
+      or list(fingerprints.index.names) != ['SessionId', 'ApplicationName']
+      or not fingerprints.index.is_unique
+      or fingerprints.index.to_frame(index=False).isna().any().any()
+  ):
+    raise ValueError(
+        'Expected unique, nonmissing (SessionId, ApplicationName) index keys.'
+    )
+  if not fingerprints.columns.is_unique:
+    raise ValueError('Fingerprint column names must be unique.')
+  missing_columns = set(features) - set(fingerprints.columns)
+  if missing_columns:
+    raise ValueError(f'Missing columns: {sorted(missing_columns)}')
+  if 'event_count' in features:
+    raise ValueError('event_count is metadata, not a feature distribution.')
+  if any(not math.isfinite(scale) or scale <= 0
+         for scale in numeric_scales.values()):
+    raise ValueError('Numeric scales must be positive and finite.')
+  return features
+
+
+def fit_application_weights(
+    fingerprints: pd.DataFrame,
+    *,
+    categorical_features: Sequence[str],
+    numeric_scales: Mapping[str, float],
+) -> pd.DataFrame:
+  """Estimate feature stability from historical, aggregated session rows.
+
+  Returns a DataFrame indexed by (ApplicationName, feature), with columns:
+    variability: Mean distance (1 - similarity) between distinct sessions.
+    weight: Mean similarity, bounded between 0 and 1; not normalized.
+    session_count: Number of sessions with evidence for this feature.
+    pair_count: Number of session pairs contributing to the estimate.
+
+  Sessions contribute equally, regardless of event_count. Empty numeric lists
+  are excluded; categorical missing values remain a category. With fewer than
+  two usable sessions, variability and weight are NaN, not estimated defaults.
+  numeric_scales maps numeric feature names to positive, finite scales reused
+  when scoring candidates. Fit on reference history, not incoming candidates.
+
+  Exact pairwise comparison is quadratic in sessions per application.
+  """
+  features = _validate_fingerprints(
+      fingerprints, categorical_features, numeric_scales
+  )
+  records = []
+  for application, sessions in fingerprints.groupby(
+      level='ApplicationName', sort=False, observed=True
+  ):
+    for feature in features:
+      observations = sessions[feature].tolist()
+      if feature in numeric_scales:
+        observations = [values for values in observations if len(values) > 0]
+      similarity_sum = 0.0
+      pair_count = 0
+      for left, right in combinations(observations, 2):
+        if feature in numeric_scales:
+          score = numeric_similarity(left, right, scale=numeric_scales[feature])
+        else:
+          score = categorical_similarity(left, right)
+        if score is not None:
+          similarity_sum += score
+          pair_count += 1
+      weight = similarity_sum / pair_count if pair_count else math.nan
+      records.append({
+          'ApplicationName': application,
+          'feature': feature,
+          'variability': 1.0 - weight,
+          'weight': weight,
+          'session_count': len(observations),
+          'pair_count': pair_count,
+      })
+  return pd.DataFrame.from_records(
+      records,
+      columns=[
+          'ApplicationName', 'feature', 'variability', 'weight',
+          'session_count', 'pair_count',
+      ],
+  ).set_index(['ApplicationName', 'feature'])
+
+
+def rank_candidates(
+    fingerprints: pd.DataFrame,
+    reference_key: tuple[Hashable, Hashable],
+    application_weights: pd.DataFrame,
+    *,
+    categorical_features: Sequence[str],
+    numeric_scales: Mapping[str, float],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+  """Compare each row against reference_key; return (ranking, feature_details).
+
+  fingerprints includes the reference and candidate rows. Only the exact
+  reference key is excluded; filter candidates by date before calling.
+  application_weights comes from fit_application_weights on reference history.
+  Use the same feature definitions and numeric scales for fitting and scoring.
+
+  Each feature uses min(reference app weight, candidate app weight). Missing
+  baselines, NaN weights, zero weights and empty numeric observations do not
+  contribute. Similarity is the weighted mean of contributing feature scores,
+  or NaN when none contribute. Coverage is the contributing feature count
+  divided by the total configured feature count (including excluded features).
+
+  Ranking is indexed by (SessionId, ApplicationName), descending similarity,
+  with NaN last and ties in input order. Details add a feature index level,
+  exposing scores, both application weights, used weights and exclusion reasons.
+  Scores are similarities, not probabilities of malicious activity.
+  """
+  features = _validate_fingerprints(
+      fingerprints, categorical_features, numeric_scales
+  )
+  if len(reference_key) != 2 or reference_key not in fingerprints.index:
+    raise ValueError('reference_key must identify an existing session/app row.')
+  if (
+      not isinstance(application_weights.index, pd.MultiIndex)
+      or list(application_weights.index.names) != ['ApplicationName', 'feature']
+      or not application_weights.index.is_unique
+      or application_weights.index.to_frame(index=False).isna().any().any()
+      or not application_weights.columns.is_unique
+      or 'weight' not in application_weights.columns
+  ):
+    raise ValueError(
+        'Expected unique (ApplicationName, feature) weight rows and a weight column.'
+    )
+  weights = pd.to_numeric(application_weights['weight'], errors='raise')
+  if any(not math.isfinite(w) or not 0 <= w <= 1 for w in weights.dropna()):
+    raise ValueError('Weights must be between 0 and 1, or NaN for unavailable.')
+
+  reference = fingerprints.loc[reference_key]
+  summaries = []
+  details = []
+  for key, candidate in fingerprints.iterrows():
+    if key == reference_key:
+      continue
+    used_weights = []
+    contributions = []
+    for feature in features:
+      if feature in numeric_scales:
+        score = numeric_similarity(
+            reference[feature], candidate[feature], scale=numeric_scales[feature]
+        )
+      else:
+        score = categorical_similarity(reference[feature], candidate[feature])
+      reference_weight = weights.get((reference_key[1], feature), math.nan)
+      candidate_weight = weights.get((key[1], feature), math.nan)
+      weight = (
+          math.nan if pd.isna(reference_weight) or pd.isna(candidate_weight)
+          else min(reference_weight, candidate_weight)
+      )
+      used_weight = 0.0
+      contribution = 0.0
+      if pd.isna(weight):
+        status = 'unavailable_weight'
+      elif weight == 0:
+        status = 'zero_weight'
+      elif score is None:
+        status = 'missing_observations'
+      else:
+        status = 'compared'
+        used_weight = weight
+        contribution = weight * score
+        used_weights.append(used_weight)
+        contributions.append(contribution)
+      details.append({
+          'SessionId': key[0], 'ApplicationName': key[1], 'feature': feature,
+          'similarity': score if score is not None else math.nan,
+          'reference_weight': reference_weight,
+          'candidate_weight': candidate_weight,
+          'weight': weight, 'used_weight': used_weight,
+          'contribution': contribution, 'status': status,
+      })
+    weight_sum = math.fsum(used_weights)
+    summaries.append({
+        'SessionId': key[0], 'ApplicationName': key[1],
+        'similarity': (
+            math.fsum(contributions) / weight_sum if weight_sum else math.nan
+        ),
+        'coverage': len(used_weights) / len(features),
+        'compared_features': len(used_weights), 'weight_sum': weight_sum,
+    })
+  ranking = pd.DataFrame.from_records(
+      summaries,
+      columns=[
+          'SessionId', 'ApplicationName', 'similarity', 'coverage',
+          'compared_features', 'weight_sum',
+      ],
+  ).set_index(['SessionId', 'ApplicationName'])
+  feature_details = pd.DataFrame.from_records(
+      details,
+      columns=[
+          'SessionId', 'ApplicationName', 'feature', 'similarity',
+          'reference_weight', 'candidate_weight', 'weight', 'used_weight',
+          'contribution', 'status',
+      ],
+  ).set_index(['SessionId', 'ApplicationName', 'feature'])
+  return (
+      ranking.sort_values(
+          'similarity', ascending=False, kind='stable', na_position='last'
+      ),
+      feature_details,
+  )
 
 
 if __name__ == '__main__':

@@ -73,23 +73,9 @@ train it. PPO is queried only to measure policy distance in these evaluations.
 
 [PPO guided meta-learning results](results\continuous_catch_ppo_meta\learning_curves.png)
 
-This didn't train successfully so further investigation is required.
+The meta network has learnt an effective rule for learning a PPO like policy, however one of the agents begins to 'forget' and the performance declines. I wonder if this agent is essentially being sacrificed to improve the performance of the other agents?
 
-## Experiment 5(b): PPO-guided meta-learning with full meta network targets
-
-Given the previous experiment wasn't successful, we try the same experiment but with `y, z, q, p` targets included in to check if these targets are required for the agent to learn a PPO-like policy. 
-
-The outer objective remains **only** Wasserstein distance to frozen PPO, with no
-A2C or extra regularizers. Inner policy, `y`, and `z` targets come from Disco.
-The auxiliary-policy `p` target is the detached next-state agent policy; `q`
-uses the original detached TD/value target. These are the original inner
-objectives, not extra targets supplied by PPO. Reward therefore participates
-in the restored inner value learning, but not directly in the outer loss.
-
-The same full inner loss is used when testing the frozen learned rule on fresh
-agents.
-
-[PPO guided meta-learning with full meta network targets results](results\continuous_catch_ppo_meta_full\learning_curves.png)
+A similar story with the fresh agents, one agent learns really well from the meta network but the others don't learn at all. The agent that learned successfully also 'forgot' and performance declined.
 
 # DiscoRL: Discovering State-of-the-art Reinforcement Learning Algorithms
 
